@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,8 +12,11 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"gopkg.in/yaml.v3"
 )
 
 // This file pins the preservation rule for embedded Dolt scopes and the
@@ -421,4 +426,261 @@ func TestTheThreeMessagesAboutOneUnreadDatabaseAgree(t *testing.T) {
 	// a documented log-flood history. Telling an operator to expect less noise
 	// than they will get is the same class of false statement as telling them
 	// rows are gone.
+}
+
+// legacyManagedCityWithEmbeddedRig builds the shape the config.yaml half of the
+// ga-p9iuv contract has to hold on: a legacy GC-managed direct city (server
+// metadata, managed_city endpoint) with a rig registered in it whose own
+// metadata.json records embedded Dolt storage. rigConfig is the rig's
+// .beads/config.yaml as bd — or an earlier gc — left it.
+func legacyManagedCityWithEmbeddedRig(t *testing.T, rigConfig string) (string, string, *config.City) {
+	t.Helper()
+	cityPath := t.TempDir()
+	writeScopeMetadata(t, cityPath, map[string]string{
+		"database":      "dolt",
+		"backend":       "dolt",
+		"dolt_mode":     "server",
+		"dolt_database": "hq",
+	})
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte("issue_prefix: hq\nissue-prefix: hq\ngc.endpoint_origin: managed_city\ngc.endpoint_status: verified\ndolt.auto-start: false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rigPath := filepath.Join(cityPath, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads", "embeddeddolt", "fr", ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeScopeMetadata(t, rigPath, map[string]string{
+		"database":      "dolt",
+		"backend":       "dolt",
+		"dolt_mode":     "embedded",
+		"dolt_database": "fr",
+	})
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "config.yaml"), []byte(rigConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "legacy-city"},
+		Rigs:      []config.Rig{{Name: "frontend", Path: rigPath, Prefix: "fr"}},
+	}
+	return cityPath, rigPath, cfg
+}
+
+func readScopeConfigKeys(t *testing.T, scope string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(scope, ".beads", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse config.yaml: %v\n%s", err, data)
+	}
+	keys := map[string]string{}
+	var walk func(prefix string, node map[string]any)
+	walk = func(prefix string, node map[string]any) {
+		for k, v := range node {
+			if nested, ok := v.(map[string]any); ok {
+				walk(prefix+k+".", nested)
+				continue
+			}
+			keys[prefix+k] = fmt.Sprint(v)
+		}
+	}
+	walk("", doc)
+	return keys
+}
+
+// embeddedScopeConfigDoors are the lifecycle doors that canonicalize a rig's
+// .beads/config.yaml without the operator naming the rig: the boot/doctor/
+// reload normalization (which also runs the port-file sync), the per-scope init
+// normalization `gc rig add` and `gc init` run, and the per-scope write
+// `gc beads city migrate-proxied` performs.
+func embeddedScopeConfigDoors(cityPath, rigPath string, cfg *config.City) map[string]func() error {
+	return map[string]func() error{
+		"boot normalization": func() error {
+			return normalizeCanonicalBdScopeFiles(cityPath, cfg, io.Discard)
+		},
+		"init normalization": func() error {
+			return normalizeCanonicalBdScopeFilesForInit(cityPath, rigPath, "fr", "")
+		},
+		"direct scope write": func() error {
+			return normalizeScopeDoltConfig(rigPath, contract.ConfigState{
+				IssuePrefix:    "fr",
+				EndpointOrigin: contract.EndpointOriginInheritedCity,
+				EndpointStatus: contract.EndpointStatusVerified,
+				DoltMode:       "server",
+			})
+		},
+	}
+}
+
+// TestNoDoorStampsServerTopologyIntoAnEmbeddedScopesConfig is the config.yaml
+// half of TestNoDoorFlipsAnEmbeddedScopesStorageMode. Keeping metadata.json at
+// embedded while writing `dolt.mode: server` and a gc endpoint origin beside it
+// records a topology claim ensureCanonicalScopeMetadata then refuses to act on
+// — and that any other reader of config.yaml acts on. It also turns off
+// policies (bd's own backup, JSONL export) on a scope gc does not back up or
+// serve, and leaves a git-tracked file dirty on every pass.
+func TestNoDoorStampsServerTopologyIntoAnEmbeddedScopesConfig(t *testing.T) {
+	const bdInitConfig = "issue_prefix: fr\nissue-prefix: fr\nsync.branch: main\n"
+	gcOwnedOrPolicy := []string{
+		"gc.endpoint_origin", "gc.endpoint_status",
+		"dolt.mode", "dolt.host", "dolt.port", "dolt.user", "dolt.socket",
+		"dolt.auto-start", "dolt.disable-event-flush",
+		"export.auto", "backup.enabled",
+	}
+	for _, name := range []string{"boot normalization", "init normalization", "direct scope write"} {
+		t.Run(name, func(t *testing.T) {
+			cityPath, rigPath, cfg := legacyManagedCityWithEmbeddedRig(t, bdInitConfig)
+			if err := os.WriteFile(filepath.Join(rigPath, ".beads", "issues.jsonl"), []byte("{}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			captureStorageModeChanges(t)
+			if err := embeddedScopeConfigDoors(cityPath, rigPath, cfg)[name](); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if mode := readScopeDoltMode(t, rigPath); mode != "embedded" {
+				t.Fatalf("dolt_mode = %q, want embedded", mode)
+			}
+			keys := readScopeConfigKeys(t, rigPath)
+			for _, key := range gcOwnedOrPolicy {
+				if value, ok := keys[key]; ok {
+					t.Errorf("config.yaml gained %s: %s on an embedded scope: %v", key, value, keys)
+				}
+			}
+			for key, want := range map[string]string{"issue_prefix": "fr", "issue-prefix": "fr", "sync.branch": "main"} {
+				if keys[key] != want {
+					t.Errorf("config.yaml %s = %q, want %q: %v", key, keys[key], want, keys)
+				}
+			}
+			if !strings.Contains(keys["types.custom"], "molecule") {
+				t.Errorf("config.yaml types.custom = %q, want gc's required vocabulary registered", keys["types.custom"])
+			}
+			if _, err := os.Stat(filepath.Join(rigPath, ".beads", "issues.jsonl")); err != nil {
+				t.Errorf("issues.jsonl on an embedded scope was removed: %v", err)
+			}
+		})
+	}
+}
+
+// TestAnAlreadyStampedEmbeddedScopeConvergesOffGcsEndpointClaims covers the
+// rigs an earlier gc already stamped. The keys gc provably owns — its own
+// gc.endpoint_* namespace, and a dolt.mode that contradicts the embedded
+// metadata.json beside it — are removed, together with the dolt.host/port/user
+// mirror when gc's endpoint marker proves gc wrote that block. The policy keys
+// (backup, export, auto-start, event flush) cannot be told apart from an
+// operator's own setting, so they are left exactly as found.
+func TestAnAlreadyStampedEmbeddedScopeConvergesOffGcsEndpointClaims(t *testing.T) {
+	const stamped = "issue_prefix: fr\nissue-prefix: fr\nsync.branch: main\n" +
+		"gc.endpoint_origin: inherited_city\ngc.endpoint_status: verified\n" +
+		"dolt.mode: server\ndolt.host: 127.0.0.1\ndolt.port: 3307\ndolt.user: root\n" +
+		"dolt.auto-start: false\ndolt:\n  disable-event-flush: true\n" +
+		"export.auto: false\nbackup.enabled: false\n" +
+		"types.custom: molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step,startup-health-episode,custom-extra\n"
+	for _, name := range []string{"boot normalization", "init normalization", "direct scope write"} {
+		t.Run(name, func(t *testing.T) {
+			cityPath, rigPath, cfg := legacyManagedCityWithEmbeddedRig(t, stamped)
+			captureStorageModeChanges(t)
+			door := embeddedScopeConfigDoors(cityPath, rigPath, cfg)[name]
+			if err := door(); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			keys := readScopeConfigKeys(t, rigPath)
+			for _, key := range []string{"gc.endpoint_origin", "gc.endpoint_status", "dolt.mode", "dolt.host", "dolt.port", "dolt.user"} {
+				if value, ok := keys[key]; ok {
+					t.Errorf("config.yaml still carries gc-authored %s: %s: %v", key, value, keys)
+				}
+			}
+			for key, want := range map[string]string{
+				"issue_prefix":             "fr",
+				"sync.branch":              "main",
+				"dolt.auto-start":          "false",
+				"dolt.disable-event-flush": "true",
+				"export.auto":              "false",
+				"backup.enabled":           "false",
+			} {
+				if keys[key] != want {
+					t.Errorf("config.yaml %s = %q, want %q left as found: %v", key, keys[key], want, keys)
+				}
+			}
+			if !strings.HasSuffix(keys["types.custom"], ",custom-extra") {
+				t.Errorf("types.custom = %q, want operator extension preserved", keys["types.custom"])
+			}
+			if mode := readScopeDoltMode(t, rigPath); mode != "embedded" {
+				t.Fatalf("dolt_mode = %q, want embedded", mode)
+			}
+
+			// Converged means the next pass writes nothing.
+			before, err := os.ReadFile(filepath.Join(rigPath, ".beads", "config.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := door(); err != nil {
+				t.Fatalf("%s (second pass): %v", name, err)
+			}
+			after, err := os.ReadFile(filepath.Join(rigPath, ".beads", "config.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("second pass rewrote a converged config.yaml:\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+// TestAnEmbeddedScopesOwnDoltModeSurvives keeps the scrub honest: a dolt.mode
+// that agrees with metadata.json is not gc's claim to remove, and without a gc
+// endpoint marker the endpoint keys are not provably gc's either.
+func TestAnEmbeddedScopesOwnDoltModeSurvives(t *testing.T) {
+	cityPath, rigPath, cfg := legacyManagedCityWithEmbeddedRig(t, "issue_prefix: fr\nissue-prefix: fr\ndolt.mode: embedded\ndolt.port: 3310\n")
+	captureStorageModeChanges(t)
+	if err := normalizeCanonicalBdScopeFiles(cityPath, cfg, io.Discard); err != nil {
+		t.Fatalf("normalizeCanonicalBdScopeFiles: %v", err)
+	}
+	keys := readScopeConfigKeys(t, rigPath)
+	if keys["dolt.mode"] != "embedded" {
+		t.Errorf("dolt.mode = %q, want the scope's own embedded value kept: %v", keys["dolt.mode"], keys)
+	}
+	if keys["dolt.port"] != "3310" {
+		t.Errorf("dolt.port = %q, want an unmarked operator key kept: %v", keys["dolt.port"], keys)
+	}
+}
+
+// TestACityEndpointChangeLeavesAnEmbeddedRigsConfigAlone is the city-endpoint
+// sweep door (`gc beads city use-external`/`use-managed`): the rigs it carries
+// along inherit the city's server, and an embedded rig has no server to
+// inherit. Sweeping it would stamp inherited_city, dolt.host/port and
+// dolt.mode: server into the rig's config.yaml while its metadata stays
+// embedded, so the plan leaves it out of the update.
+func TestACityEndpointChangeLeavesAnEmbeddedRigsConfigAlone(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	cityDir := t.TempDir()
+	rigDir := embeddedScopeWithBeads(t, "fe")
+	const bdInitConfig = "issue_prefix: fe\nissue-prefix: fe\n"
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "config.yaml"), []byte(bdInitConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeCityEndpointCityConfigWithCompat(t, cityDir, config.DoltConfig{Host: "old-city.example.com", Port: 3306}, []config.Rig{
+		{Name: "frontend", Path: rigDir, Prefix: "fe"},
+	})
+	writeRigEndpointMetadata(t, cityDir, "hq")
+	writeRigEndpointCanonicalConfig(t, cityDir, contract.ConfigState{IssuePrefix: "gc", EndpointOrigin: contract.EndpointOriginCityCanonical, EndpointStatus: contract.EndpointStatusVerified, DoltHost: "old-city.example.com", DoltPort: "3306"})
+	captureStorageModeChanges(t)
+
+	var stdout, stderr bytes.Buffer
+	code := doBeadsCityEndpoint(fsys.OSFS{}, cityDir, cityEndpointOptions{External: true, Host: "db.example.com", Port: "4406", AdoptUnverified: true}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doBeadsCityEndpoint() = %d, want 0; stderr = %s", code, stderr.String())
+	}
+	got, err := os.ReadFile(filepath.Join(rigDir, ".beads", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != bdInitConfig {
+		t.Fatalf("embedded rig config.yaml was rewritten by the city endpoint sweep:\n%s", got)
+	}
+	if mode := readScopeDoltMode(t, rigDir); mode != "embedded" {
+		t.Fatalf("dolt_mode = %q, want embedded", mode)
+	}
 }
