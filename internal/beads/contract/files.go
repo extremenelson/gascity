@@ -667,6 +667,73 @@ func EnsureCanonicalConfig(fs fsys.FS, path string, state ConfigState) (bool, er
 	return true, fsys.WriteFileAtomic(fs, path, encoded, canonicalScopeFilePerm(fs, path))
 }
 
+// EnsureEmbeddedScopeConfig reconciles config.yaml for a scope whose
+// metadata.json records embedded Dolt storage.
+//
+// Such a scope is authoritative and not gc-managed (ga-p9iuv): it has no
+// server for gc to point it at and no managed backup covering it. So gc writes
+// only the scope-local vocabulary its own reads depend on — the issue prefix
+// and the union of custom bead types — and none of EnsureCanonicalConfig's
+// endpoint, topology, or policy keys. The endpoint claims an earlier pass
+// stamped are removed where gc provably owns them: the gc.endpoint_* namespace,
+// a dolt.mode that contradicts the embedded metadata, and the dolt.host/port/
+// socket/user mirror when gc's endpoint marker shows gc wrote that block.
+// Policy keys (dolt.auto-start, dolt.disable-event-flush, export.auto,
+// backup.enabled) are left exactly as found: gc cannot tell a value it wrote
+// from an operator's.
+//
+// A file that does not parse is left untouched rather than repaired: the
+// fallback line editor stamps the managed policy keys, and the file is bd's.
+// Doctor's custom-types check still reports missing vocabulary.
+func EnsureEmbeddedScopeConfig(fs fsys.FS, path string, state ConfigState) (bool, error) {
+	missing := false
+	doc, err := readConfigDoc(fs, path)
+	if err != nil {
+		if isConfigParseError(err) {
+			return false, nil
+		}
+		if !os.IsNotExist(err) {
+			return false, err
+		}
+		missing = true
+		doc = newConfigDoc()
+	}
+
+	root := mappingRoot(doc)
+	changed := missing
+	prefix := strings.TrimSpace(state.IssuePrefix)
+	if prefix == "" {
+		prefix, _ = configStringValue(root, "issue_prefix", "issue-prefix")
+	}
+	if prefix != "" {
+		changed = setString(root, "issue_prefix", prefix) || changed
+		changed = setString(root, "issue-prefix", prefix) || changed
+	}
+	if len(state.CustomTypes) > 0 {
+		existing, _ := configStringValue(root, "types.custom")
+		if merged := MergeCustomTypes(parseCustomTypesValue(existing), state.CustomTypes); len(merged) > 0 {
+			changed = setString(root, "types.custom", strings.Join(merged, ",")) || changed
+		}
+	}
+
+	if _, gcStampedEndpoint := configStringValue(root, "gc.endpoint_origin"); gcStampedEndpoint {
+		changed = deleteKeys(root, "dolt.host", "dolt.port", "dolt.socket", "dolt.user") || changed
+	}
+	changed = deleteKeys(root, "gc.endpoint_origin", "gc.endpoint_status") || changed
+	if mode, ok := configStringValue(root, "dolt.mode"); ok && !strings.EqualFold(mode, "embedded") {
+		changed = deleteKeys(root, "dolt.mode") || changed
+	}
+	if !changed {
+		return false, nil
+	}
+
+	encoded, err := marshalConfigDoc(doc)
+	if err != nil {
+		return false, err
+	}
+	return true, fsys.WriteFileAtomic(fs, path, encoded, canonicalScopeFilePerm(fs, path))
+}
+
 // EnsureCanonicalMetadata rewrites metadata.json into canonical GC-managed form.
 func EnsureCanonicalMetadata(fs fsys.FS, path string, state MetadataState) (bool, error) {
 	meta := map[string]any{}

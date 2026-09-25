@@ -712,6 +712,17 @@ func ensureCanonicalScopeConfigState(fs fsys.FS, dir string, state contract.Conf
 	// future caller supplies its own extra types, and EnsureCanonicalConfig
 	// then unions the result with any on-disk extensions.
 	state.CustomTypes = contract.MergeCustomTypes(state.CustomTypes, doctor.RequiredCustomTypes)
+	embedded, err := scopeMetadataRecordsEmbeddedDolt(fs, dir)
+	if err != nil {
+		return err
+	}
+	if embedded {
+		// An embedded scope keeps its storage mode (ga-p9iuv), so it must not
+		// be handed the managed endpoint, topology and policy keys either —
+		// nor lose its issues.jsonl, which nothing gc runs replaces for it.
+		_, err := contract.EnsureEmbeddedScopeConfig(fs, filepath.Join(beadsDir, "config.yaml"), state)
+		return err
+	}
 	// The topology belongs to metadata.json, not here. See canonicalConfigDoltMode.
 	state.DoltMode = canonicalConfigDoltMode(state.DoltMode)
 	changed, err := contract.EnsureCanonicalConfig(fs, filepath.Join(beadsDir, "config.yaml"), state)
@@ -730,6 +741,23 @@ func ensureCanonicalScopeConfigState(fs fsys.FS, dir string, state contract.Conf
 		removeStaleBdExportJSONL(fs, beadsDir)
 	}
 	return nil
+}
+
+// scopeMetadataRecordsEmbeddedDolt reports whether dir's metadata.json records
+// embedded Dolt storage under the explicit dolt backend — the same condition
+// under which ensureCanonicalScopeMetadata treats the recorded mode as
+// authoritative and preserves it.
+func scopeMetadataRecordsEmbeddedDolt(fs fsys.FS, dir string) (bool, error) {
+	path := scopeMetadataJSONPath(dir)
+	backend, ok, err := contract.ReadMetadataBackend(fs, path)
+	if err != nil || !ok || !strings.EqualFold(backend, "dolt") {
+		return false, err
+	}
+	mode, ok, err := contract.ReadDoltMode(fs, path)
+	if err != nil || !ok {
+		return false, err
+	}
+	return strings.EqualFold(mode, "embedded"), nil
 }
 
 // removeStaleBdExportJSONL removes .beads/issues.jsonl if present. Called after
@@ -1818,7 +1846,7 @@ func initBeadsForDirWithExecutor(cityPath, dir, prefix, doltDatabase string, exe
 			args = append(args, doltDatabase)
 		}
 		script := strings.TrimPrefix(provider, "exec:")
-		if execProviderUsesCanonicalBdScopeFiles(provider) && (scopeInitUsesProxiedDoltMode(cityPath, dir)) {
+		if execProviderUsesCanonicalBdScopeFiles(provider) && scopeInitUsesProxiedDoltMode(cityPath, dir) {
 			// Callers may invoke initBeadsForDir directly without the
 			// initAndHookDir wrapper that normally supplies the canonical
 			// database name. Resolve the same fallback here so proxied and
