@@ -703,6 +703,19 @@ func providerOwnedScopeCustomTypesEnv(cityPath, dir string) (map[string]string, 
 //nolint:unparam // keep fs seam for future testable FS injection
 func ensureCanonicalScopeConfigState(fs fsys.FS, dir string, state contract.ConfigState) error {
 	beadsDir := filepath.Join(dir, ".beads")
+	embedded, err := scopeMetadataRecordsEmbeddedDolt(fs, dir)
+	if err != nil {
+		return err
+	}
+	if embedded {
+		// An embedded scope keeps its storage mode (ga-p9iuv) and its .beads
+		// stays bd's: gc only takes back endpoint claims an earlier pass
+		// stamped. No managed endpoint, topology or policy keys, no prefix or
+		// types line (bd answers both from the store), no chmod of bd's
+		// directory, and no removal of an issues.jsonl nothing gc replaces.
+		_, err := contract.ScrubEmbeddedScopeConfig(fs, filepath.Join(beadsDir, "config.yaml"))
+		return err
+	}
 	if err := ensureBeadsDir(fs, beadsDir); err != nil {
 		return err
 	}
@@ -712,17 +725,6 @@ func ensureCanonicalScopeConfigState(fs fsys.FS, dir string, state contract.Conf
 	// future caller supplies its own extra types, and EnsureCanonicalConfig
 	// then unions the result with any on-disk extensions.
 	state.CustomTypes = contract.MergeCustomTypes(state.CustomTypes, doctor.RequiredCustomTypes)
-	embedded, err := scopeMetadataRecordsEmbeddedDolt(fs, dir)
-	if err != nil {
-		return err
-	}
-	if embedded {
-		// An embedded scope keeps its storage mode (ga-p9iuv), so it must not
-		// be handed the managed endpoint, topology and policy keys either —
-		// nor lose its issues.jsonl, which nothing gc runs replaces for it.
-		_, err := contract.EnsureEmbeddedScopeConfig(fs, filepath.Join(beadsDir, "config.yaml"), state)
-		return err
-	}
 	// The topology belongs to metadata.json, not here. See canonicalConfigDoltMode.
 	state.DoltMode = canonicalConfigDoltMode(state.DoltMode)
 	changed, err := contract.EnsureCanonicalConfig(fs, filepath.Join(beadsDir, "config.yaml"), state)

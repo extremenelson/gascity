@@ -667,55 +667,41 @@ func EnsureCanonicalConfig(fs fsys.FS, path string, state ConfigState) (bool, er
 	return true, fsys.WriteFileAtomic(fs, path, encoded, canonicalScopeFilePerm(fs, path))
 }
 
-// EnsureEmbeddedScopeConfig reconciles config.yaml for a scope whose
-// metadata.json records embedded Dolt storage.
+// ScrubEmbeddedScopeConfig removes gc's own endpoint claims from config.yaml
+// for a scope whose metadata.json records embedded Dolt storage, and writes
+// nothing else.
 //
-// Such a scope is authoritative and not gc-managed (ga-p9iuv): it has no
-// server for gc to point it at and no managed backup covering it. So gc writes
-// only the scope-local vocabulary its own reads depend on — the issue prefix
-// and the union of custom bead types — and none of EnsureCanonicalConfig's
-// endpoint, topology, or policy keys. The endpoint claims an earlier pass
-// stamped are removed where gc provably owns them: the gc.endpoint_* namespace,
-// a dolt.mode that contradicts the embedded metadata, and the dolt.host/port/
-// socket/user mirror when gc's endpoint marker shows gc wrote that block.
-// Policy keys (dolt.auto-start, dolt.disable-event-flush, export.auto,
-// backup.enabled) are left exactly as found: gc cannot tell a value it wrote
-// from an operator's.
+// Such a scope is authoritative and not gc-managed (ga-p9iuv), and its
+// config.yaml is bd's git-tracked file. bd answers the scope's vocabulary from
+// the store, not from this file: the issue prefix from the config table, the
+// custom types from the custom_types table ahead of the config row, with YAML
+// only as the last fallback. So gc adds nothing here — no prefix (bd create
+// reads YAML issue-prefix ahead of the store's, so a stamped prefix would
+// override the store), no types.custom (never read while the store's table is
+// populated; doctor's custom-types check registers missing types through
+// `bd config set`), and none of EnsureCanonicalConfig's endpoint, topology or
+// policy keys. A missing file stays missing.
 //
-// A file that does not parse is left untouched rather than repaired: the
-// fallback line editor stamps the managed policy keys, and the file is bd's.
-// Doctor's custom-types check still reports missing vocabulary.
-func EnsureEmbeddedScopeConfig(fs fsys.FS, path string, state ConfigState) (bool, error) {
-	missing := false
+// What it does remove are the claims an earlier gc pass stamped and gc
+// provably owns: the gc.endpoint_* namespace, a dolt.mode that contradicts the
+// embedded metadata, and the dolt.host/port/socket/user mirror when gc's
+// endpoint marker shows gc wrote that block. Policy keys (dolt.auto-start,
+// dolt.disable-event-flush, export.auto, backup.enabled) and any prefix or
+// types line are left exactly as found: gc cannot tell a value it wrote from
+// an operator's. A clean file is therefore never rewritten.
+//
+// A file that does not parse is left untouched rather than repaired.
+func ScrubEmbeddedScopeConfig(fs fsys.FS, path string) (bool, error) {
 	doc, err := readConfigDoc(fs, path)
 	if err != nil {
-		if isConfigParseError(err) {
+		if isConfigParseError(err) || os.IsNotExist(err) {
 			return false, nil
 		}
-		if !os.IsNotExist(err) {
-			return false, err
-		}
-		missing = true
-		doc = newConfigDoc()
+		return false, err
 	}
 
 	root := mappingRoot(doc)
-	changed := missing
-	prefix := strings.TrimSpace(state.IssuePrefix)
-	if prefix == "" {
-		prefix, _ = configStringValue(root, "issue_prefix", "issue-prefix")
-	}
-	if prefix != "" {
-		changed = setString(root, "issue_prefix", prefix) || changed
-		changed = setString(root, "issue-prefix", prefix) || changed
-	}
-	if len(state.CustomTypes) > 0 {
-		existing, _ := configStringValue(root, "types.custom")
-		if merged := MergeCustomTypes(parseCustomTypesValue(existing), state.CustomTypes); len(merged) > 0 {
-			changed = setString(root, "types.custom", strings.Join(merged, ",")) || changed
-		}
-	}
-
+	changed := false
 	if _, gcStampedEndpoint := configStringValue(root, "gc.endpoint_origin"); gcStampedEndpoint {
 		changed = deleteKeys(root, "dolt.host", "dolt.port", "dolt.socket", "dolt.user") || changed
 	}

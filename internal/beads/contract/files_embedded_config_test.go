@@ -18,55 +18,57 @@ func writeEmbeddedConfig(t *testing.T, content string) string {
 	return path
 }
 
-// An embedded scope's config gains only the scope-local vocabulary: none of
-// EnsureCanonicalConfig's endpoint, topology, or policy keys.
-func TestEnsureEmbeddedScopeConfigWritesOnlyVocabulary(t *testing.T) {
-	path := writeEmbeddedConfig(t, "sync.branch: main\n")
-	changed, err := EnsureEmbeddedScopeConfig(fsys.OSFS{}, path, ConfigState{
-		IssuePrefix:    "fr",
-		EndpointOrigin: EndpointOriginInheritedCity,
-		EndpointStatus: EndpointStatusVerified,
-		DoltHost:       "db.example.com",
-		DoltPort:       "3307",
-		DoltUser:       "root",
-		DoltMode:       "server",
-		CustomTypes:    []string{"molecule", "convoy"},
-	})
-	if err != nil || !changed {
-		t.Fatalf("EnsureEmbeddedScopeConfig = (%v, %v), want (true, nil)", changed, err)
+// cleanEmbeddedBdConfig is the shape bd itself leaves in an embedded repo: its
+// commented template plus bd-owned keys, and no issue prefix or custom types —
+// bd keeps both in the store (config table / custom_types table).
+const cleanEmbeddedBdConfig = `# Beads Configuration File
+# This file configures default behavior for all bd commands in this repository
+
+# Use no-db mode: JSONL-only, no Dolt database
+# no-db: false
+
+sync.branch: main
+dolt.mode: embedded
+`
+
+// A clean embedded config is bd's, not gc's: the scrub leaves every byte in
+// place and reports no change.
+func TestScrubEmbeddedScopeConfigLeavesACleanFileByteIdentical(t *testing.T) {
+	path := writeEmbeddedConfig(t, cleanEmbeddedBdConfig)
+	changed, err := ScrubEmbeddedScopeConfig(fsys.OSFS{}, path)
+	if err != nil || changed {
+		t.Fatalf("ScrubEmbeddedScopeConfig = (%v, %v), want (false, nil)", changed, err)
 	}
-	got := readConfigFile(t, path)
-	for _, want := range []string{"sync.branch: main", "issue_prefix: fr", "issue-prefix: fr", "types.custom: molecule,convoy"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("config missing %q:\n%s", want, got)
-		}
-	}
-	for _, forbidden := range []string{"gc.endpoint", "dolt.", "dolt:", "export.auto", "backup.enabled"} {
-		if strings.Contains(got, forbidden) {
-			t.Errorf("config gained %q on an embedded scope:\n%s", forbidden, got)
-		}
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Errorf("mode = %v, want bd's 0600 preserved", info.Mode().Perm())
+	if got := readConfigFile(t, path); got != cleanEmbeddedBdConfig {
+		t.Fatalf("clean embedded config was rewritten:\n%s", got)
 	}
 }
 
-// The endpoint mirror is gc's only when gc's marker says so; policy keys and a
-// dolt.mode agreeing with metadata are never gc's to remove.
-func TestEnsureEmbeddedScopeConfigScrubsOnlyGcOwnedKeys(t *testing.T) {
+// The scrub never materializes a config.yaml bd did not write.
+func TestScrubEmbeddedScopeConfigDoesNotCreateAMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	changed, err := ScrubEmbeddedScopeConfig(fsys.OSFS{}, path)
+	if err != nil || changed {
+		t.Fatalf("ScrubEmbeddedScopeConfig = (%v, %v), want (false, nil)", changed, err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("missing config.yaml was created (stat err = %v)", err)
+	}
+}
+
+// The endpoint mirror is gc's only when gc's marker says so; policy keys, the
+// vocabulary keys and a dolt.mode agreeing with metadata are never gc's to
+// remove.
+func TestScrubEmbeddedScopeConfigRemovesOnlyGcOwnedKeys(t *testing.T) {
 	for name, tc := range map[string]struct {
 		in       string
 		gone     []string
 		retained []string
 	}{
 		"gc-stamped endpoint block": {
-			in:       "gc.endpoint_origin: inherited_city\ngc.endpoint_status: verified\ndolt.mode: server\ndolt.host: 127.0.0.1\ndolt.port: 3307\ndolt.user: root\nbackup.enabled: false\nexport.auto: false\ndolt.auto-start: false\n",
+			in:       "issue_prefix: fr\ntypes.custom: molecule\ngc.endpoint_origin: inherited_city\ngc.endpoint_status: verified\ndolt.mode: server\ndolt.host: 127.0.0.1\ndolt.port: 3307\ndolt.user: root\nbackup.enabled: false\nexport.auto: false\ndolt.auto-start: false\n",
 			gone:     []string{"gc.endpoint_origin", "gc.endpoint_status", "dolt.mode", "dolt.host", "dolt.port", "dolt.user"},
-			retained: []string{"backup.enabled: false", "export.auto: false", "dolt.auto-start: false"},
+			retained: []string{"issue_prefix: fr", "types.custom: molecule", "backup.enabled: false", "export.auto: false", "dolt.auto-start: false"},
 		},
 		"no gc marker": {
 			in:       "dolt.mode: embedded\ndolt.port: 3310\n",
@@ -80,7 +82,7 @@ func TestEnsureEmbeddedScopeConfigScrubsOnlyGcOwnedKeys(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := writeEmbeddedConfig(t, tc.in)
-			if _, err := EnsureEmbeddedScopeConfig(fsys.OSFS{}, path, ConfigState{}); err != nil {
+			if _, err := ScrubEmbeddedScopeConfig(fsys.OSFS{}, path); err != nil {
 				t.Fatal(err)
 			}
 			got := readConfigFile(t, path)
@@ -94,7 +96,14 @@ func TestEnsureEmbeddedScopeConfigScrubsOnlyGcOwnedKeys(t *testing.T) {
 					t.Errorf("%q was removed:\n%s", want, got)
 				}
 			}
-			if changed, err := EnsureEmbeddedScopeConfig(fsys.OSFS{}, path, ConfigState{}); err != nil || changed {
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Errorf("mode = %v, want bd's 0600 preserved", info.Mode().Perm())
+			}
+			if changed, err := ScrubEmbeddedScopeConfig(fsys.OSFS{}, path); err != nil || changed {
 				t.Fatalf("second pass = (%v, %v), want (false, nil)", changed, err)
 			}
 		})
@@ -102,12 +111,12 @@ func TestEnsureEmbeddedScopeConfigScrubsOnlyGcOwnedKeys(t *testing.T) {
 }
 
 // bd's file is not repaired into gc's shape when it does not parse.
-func TestEnsureEmbeddedScopeConfigLeavesUnparseableFileAlone(t *testing.T) {
-	const malformed = "issue_prefix: fr\n  bad: [indent\n"
+func TestScrubEmbeddedScopeConfigLeavesUnparseableFileAlone(t *testing.T) {
+	const malformed = "gc.endpoint_origin: inherited_city\n  bad: [indent\n"
 	path := writeEmbeddedConfig(t, malformed)
-	changed, err := EnsureEmbeddedScopeConfig(fsys.OSFS{}, path, ConfigState{IssuePrefix: "fr", CustomTypes: []string{"molecule"}})
+	changed, err := ScrubEmbeddedScopeConfig(fsys.OSFS{}, path)
 	if err != nil || changed {
-		t.Fatalf("EnsureEmbeddedScopeConfig = (%v, %v), want (false, nil)", changed, err)
+		t.Fatalf("ScrubEmbeddedScopeConfig = (%v, %v), want (false, nil)", changed, err)
 	}
 	if got := readConfigFile(t, path); got != malformed {
 		t.Fatalf("unparseable config was rewritten:\n%s", got)
