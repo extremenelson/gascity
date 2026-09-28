@@ -927,6 +927,23 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 		}
 		return nil
 	}
+	if embedded, err := scopeMetadataRecordsEmbeddedDolt(fsys.OSFS{}, dir); err != nil {
+		return err
+	} else if embedded && cityUsesBdStoreContract(cityPath) {
+		// An embedded scope's store already lives in .beads/embeddeddolt and
+		// stays authoritative (ga-p9iuv). The managed-Dolt init chain would
+		// register a database for it on the city's server and run a
+		// server-mode bd init over it (#6118), so only the normalization pass
+		// runs — it takes back endpoint claims an earlier gc stamped and is a
+		// no-op on a clean scope.
+		if err := normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, ""); err != nil {
+			return err
+		}
+		if err := installBeadHooks(dir, cityPath); err != nil {
+			return fmt.Errorf("install hooks at %s: %w", dir, err)
+		}
+		return nil
+	}
 	doltDatabase := canonicalScopeDoltDatabase(cityPath, dir, prefix)
 	if err := normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase); err != nil {
 		return err
