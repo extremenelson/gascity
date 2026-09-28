@@ -731,3 +731,76 @@ func TestACityEndpointChangeLeavesAnEmbeddedRigsConfigAlone(t *testing.T) {
 		})
 	}
 }
+
+// recordingBdProviderScript installs a gc-beads-bd exec provider that records
+// every operation it is asked to run and fails each one, so a test can prove a
+// door never reached the managed-Dolt init chain (ensure_database_registered,
+// `bd init --server`, the project-identity migration).
+func recordingBdProviderScript(t *testing.T, cityPath string) string {
+	t.Helper()
+	callsFile := filepath.Join(t.TempDir(), "provider-calls.log")
+	script := filepath.Join(t.TempDir(), "gc-beads-bd")
+	body := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %q\nexit 99\n", callsFile)
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_BEADS", "exec:"+script)
+	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
+	return callsFile
+}
+
+// TestInitializingAnEmbeddedRigNeverRunsManagedDoltInit is the init half of
+// #6118. `gc rig add` and each city start run initAndHookDir for every rig; on
+// an embedded rig that used to fall through to the managed-Dolt chain, which
+// registers a database for the rig on the city's server and runs a
+// server-mode `bd init` over a store that already lives in
+// .beads/embeddeddolt. The embedded store is authoritative (ga-p9iuv), so the
+// door must not call the provider at all and must leave .beads byte-identical.
+func TestInitializingAnEmbeddedRigNeverRunsManagedDoltInit(t *testing.T) {
+	cityPath, rigPath, _ := legacyManagedCityWithEmbeddedRig(t, cleanEmbeddedRigConfig)
+	callsFile := recordingBdProviderScript(t, cityPath)
+	before := snapshotScopeBeadsFiles(t, rigPath)
+	captureStorageModeChanges(t)
+
+	for pass := 1; pass <= 2; pass++ {
+		if err := initAndHookDir(cityPath, rigPath, "fr"); err != nil {
+			t.Fatalf("initAndHookDir (pass %d): %v", pass, err)
+		}
+		assertScopeBeadsFilesUnchanged(t, fmt.Sprintf("initAndHookDir (pass %d)", pass), before, snapshotScopeBeadsFiles(t, rigPath))
+	}
+	if data, err := os.ReadFile(callsFile); err == nil {
+		t.Fatalf("managed-Dolt provider ran for an embedded rig; calls:\n%s", data)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("read provider calls: %v", err)
+	}
+}
+
+// TestInitializingAnAlreadyStampedEmbeddedRigStillScrubsGcsClaims keeps the
+// init door's skip from stranding a rig an earlier gc already stamped: the
+// endpoint claims gc provably owns still come off on the way past.
+func TestInitializingAnAlreadyStampedEmbeddedRigStillScrubsGcsClaims(t *testing.T) {
+	const stamped = "issue_prefix: fr\nsync.branch: main\n" +
+		"gc.endpoint_origin: inherited_city\ngc.endpoint_status: verified\n" +
+		"dolt.mode: server\ndolt.host: 127.0.0.1\ndolt.port: 3307\ndolt.user: root\n"
+	cityPath, rigPath, _ := legacyManagedCityWithEmbeddedRig(t, stamped)
+	callsFile := recordingBdProviderScript(t, cityPath)
+	captureStorageModeChanges(t)
+
+	if err := initAndHookDir(cityPath, rigPath, "fr"); err != nil {
+		t.Fatalf("initAndHookDir: %v", err)
+	}
+	keys := readScopeConfigKeys(t, rigPath)
+	for _, key := range []string{"gc.endpoint_origin", "gc.endpoint_status", "dolt.mode", "dolt.host", "dolt.port", "dolt.user"} {
+		if value, ok := keys[key]; ok {
+			t.Errorf("config.yaml still carries gc-authored %s: %s: %v", key, value, keys)
+		}
+	}
+	if mode := readScopeDoltMode(t, rigPath); mode != "embedded" {
+		t.Fatalf("dolt_mode = %q, want embedded", mode)
+	}
+	if data, err := os.ReadFile(callsFile); err == nil {
+		t.Fatalf("managed-Dolt provider ran for an embedded rig; calls:\n%s", data)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("read provider calls: %v", err)
+	}
+}
