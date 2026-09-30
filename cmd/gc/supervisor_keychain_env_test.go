@@ -93,7 +93,6 @@ func TestLoadSupervisorKeychainEnvSetsUnsetKeys(t *testing.T) {
 	t.Setenv("USER", "operator")
 	t.Setenv(supervisorKeychainEnvVar, "AWS_BEARER_TOKEN_BEDROCK=claude-bedrock-token")
 	t.Setenv("AWS_BEARER_TOKEN_BEDROCK", "")
-	_ = os.Unsetenv("AWS_BEARER_TOKEN_BEDROCK")
 	calls := stubSupervisorKeychainLookup(t, func(string, string) (string, error) {
 		return "token-from-keychain", nil
 	})
@@ -135,7 +134,6 @@ func TestLoadSupervisorKeychainEnvReportsFailures(t *testing.T) {
 	t.Setenv(supervisorKeychainEnvVar, "MISSING_TOKEN=missing-item EMPTY_TOKEN=empty-item bad-entry")
 	for _, key := range []string{"MISSING_TOKEN", "EMPTY_TOKEN"} {
 		t.Setenv(key, "")
-		_ = os.Unsetenv(key)
 	}
 	stubSupervisorKeychainLookup(t, func(_, service string) (string, error) {
 		if service == "missing-item" {
@@ -148,8 +146,8 @@ func TestLoadSupervisorKeychainEnvReportsFailures(t *testing.T) {
 	loadSupervisorKeychainEnv(&stderr)
 
 	for _, key := range []string{"MISSING_TOKEN", "EMPTY_TOKEN"} {
-		if v, ok := os.LookupEnv(key); ok {
-			t.Fatalf("%s = %q after a failed lookup, want unset", key, v)
+		if v := os.Getenv(key); v != "" {
+			t.Fatalf("%s = %q after a failed lookup, want it left empty", key, v)
 		}
 	}
 	out := stderr.String()
@@ -191,7 +189,6 @@ func TestDoSupervisorRunLoadsKeychainEnv(t *testing.T) {
 	t.Setenv("USER", "operator")
 	t.Setenv(supervisorKeychainEnvVar, "AWS_BEARER_TOKEN_BEDROCK=claude-bedrock-token")
 	t.Setenv("AWS_BEARER_TOKEN_BEDROCK", "")
-	_ = os.Unsetenv("AWS_BEARER_TOKEN_BEDROCK")
 	stubSupervisorKeychainLookup(t, func(string, string) (string, error) {
 		return "token-from-keychain", nil
 	})
