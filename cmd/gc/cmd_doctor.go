@@ -65,10 +65,7 @@ listed.`,
   gc doctor --check controller,events-log --json`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if doDoctor(opts, stdout, stderr) != 0 {
-				return errExit
-			}
-			return nil
+			return exitForCode(doDoctor(opts, stdout, stderr))
 		},
 	}
 	cmd.Flags().BoolVar(&opts.Fix, "fix", false, "attempt automatic repairs and safe mechanical migrations")
