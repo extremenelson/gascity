@@ -678,46 +678,61 @@ func EnsureCanonicalConfig(fs fsys.FS, path string, state ConfigState) (bool, er
 // only as the last fallback. So gc adds nothing here — no prefix (bd create
 // reads YAML issue-prefix ahead of the store's, so a stamped prefix would
 // override the store), no types.custom (never read while the store's table is
-// populated; doctor's custom-types check registers missing types through
+// populated; missing types are registered in the store through
 // `bd config set`), and none of EnsureCanonicalConfig's endpoint, topology or
 // policy keys. A missing file stays missing.
 //
-// What it does remove are the claims an earlier gc pass stamped and gc
-// provably owns: the gc.endpoint_* namespace, a dolt.mode that contradicts the
-// embedded metadata, and the dolt.host/port/socket/user mirror when gc's
-// endpoint marker shows gc wrote that block. Policy keys (dolt.auto-start,
-// dolt.disable-event-flush, export.auto, backup.enabled) and any prefix or
-// types line are left exactly as found: gc cannot tell a value it wrote from
-// an operator's. A clean file is therefore never rewritten.
+// What it does remove, in both the flat and bd's nested spelling, are the
+// claims an earlier gc pass stamped and gc provably owns: the gc.endpoint_*
+// namespace, a dolt.mode that contradicts the embedded metadata, and the
+// dolt.host/port/socket/user mirror when gc's endpoint marker shows gc wrote
+// that block. Policy keys (dolt.auto-start, dolt.disable-event-flush,
+// export.auto, backup.enabled) and any prefix or types line are left exactly
+// as found: gc cannot tell a value it wrote from an operator's. A clean file
+// is therefore never rewritten.
 //
-// A file that does not parse is left untouched rather than repaired.
-func ScrubEmbeddedScopeConfig(fs fsys.FS, path string) (bool, error) {
+// It returns the flat names of the claims it removed, in removal order, so the
+// caller can say what it took out of a file it does not own; nil means nothing
+// was written. A file that does not parse is left untouched rather than
+// repaired.
+func ScrubEmbeddedScopeConfig(fs fsys.FS, path string) ([]string, error) {
 	doc, err := readConfigDoc(fs, path)
 	if err != nil {
 		if isConfigParseError(err) || os.IsNotExist(err) {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
 
 	root := mappingRoot(doc)
-	changed := false
-	if _, gcStampedEndpoint := configStringValue(root, "gc.endpoint_origin"); gcStampedEndpoint {
-		changed = deleteKeys(root, "dolt.host", "dolt.port", "dolt.socket", "dolt.user") || changed
-	}
-	changed = deleteKeys(root, "gc.endpoint_origin", "gc.endpoint_status") || changed
+	// The endpoint mirror is gc's only while gc's marker vouches for it, so
+	// read the marker before the claims (the marker among them) come off.
+	_, gcStampedEndpoint := configStringValue(root, "gc.endpoint_origin")
+	claims := []string{"gc.endpoint_origin", "gc.endpoint_status"}
 	if mode, ok := configStringValue(root, "dolt.mode"); ok && !strings.EqualFold(mode, "embedded") {
-		changed = deleteKeys(root, "dolt.mode") || changed
+		claims = append(claims, "dolt.mode")
 	}
-	if !changed {
-		return false, nil
+	if gcStampedEndpoint {
+		claims = append(claims, "dolt.host", "dolt.port", "dolt.socket", "dolt.user")
+	}
+	var removed []string
+	for _, key := range claims {
+		if deleteConfigKeys(root, key) {
+			removed = append(removed, key)
+		}
+	}
+	if len(removed) == 0 {
+		return nil, nil
 	}
 
 	encoded, err := marshalConfigDoc(doc)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return true, fsys.WriteFileAtomic(fs, path, encoded, canonicalScopeFilePerm(fs, path))
+	if err := fsys.WriteFileAtomic(fs, path, encoded, canonicalScopeFilePerm(fs, path)); err != nil {
+		return nil, err
+	}
+	return removed, nil
 }
 
 // EnsureCanonicalMetadata rewrites metadata.json into canonical GC-managed form.

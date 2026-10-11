@@ -1072,6 +1072,7 @@ go_test(
         "drift_test.go",
         "effective_api_url_test.go",
         "embed_builtin_packs_test.go",
+        "embedded_rig_custom_types_integration_test.go",
         "endpoint_capacity_test.go",
         "event_export_test.go",
         "execution_backstop_test.go",
