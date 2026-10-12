@@ -773,6 +773,20 @@ func ensureCanonicalScopeConfigState(fs fsys.FS, dir string, state contract.Conf
 	return nil
 }
 
+// removeStaleBdExportJSONL removes .beads/issues.jsonl if present. Called after
+// EnsureCanonicalConfig writes export.auto:false, since the file is a stale
+// export that bd's auto-import path would otherwise re-load on every write,
+// stalling bd create for the full subprocess timeout on large datasets.
+// Best-effort: any error is non-fatal because the env-var BD_EXPORT_AUTO=false
+// path (bdRuntimeEnv) is a second line of defense for gc-initiated calls.
+func removeStaleBdExportJSONL(fs fsys.FS, beadsDir string) {
+	path := filepath.Join(beadsDir, "issues.jsonl")
+	if _, err := fs.Stat(path); err != nil {
+		return
+	}
+	_ = fs.Remove(path)
+}
+
 // scopeMetadataRecordsEmbeddedDolt reports whether dir's metadata.json records
 // embedded Dolt storage under the explicit dolt backend — the same condition
 // under which ensureCanonicalScopeMetadata treats the recorded mode as
@@ -804,20 +818,6 @@ func scrubEmbeddedScopeEndpointClaims(fs fsys.FS, dir string) error {
 		log.Printf("gc: removed gc-stamped endpoint claims from embedded scope config %s: %s", path, strings.Join(removed, ", "))
 	}
 	return nil
-}
-
-// removeStaleBdExportJSONL removes .beads/issues.jsonl if present. Called after
-// EnsureCanonicalConfig writes export.auto:false, since the file is a stale
-// export that bd's auto-import path would otherwise re-load on every write,
-// stalling bd create for the full subprocess timeout on large datasets.
-// Best-effort: any error is non-fatal because the env-var BD_EXPORT_AUTO=false
-// path (bdRuntimeEnv) is a second line of defense for gc-initiated calls.
-func removeStaleBdExportJSONL(fs fsys.FS, beadsDir string) {
-	path := filepath.Join(beadsDir, "issues.jsonl")
-	if _, err := fs.Stat(path); err != nil {
-		return
-	}
-	_ = fs.Remove(path)
 }
 
 func seedDeferredManagedBeads(cityPath, dir, prefix, doltDatabase string) {
